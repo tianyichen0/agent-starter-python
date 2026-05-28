@@ -14,6 +14,9 @@ from livekit.agents import (
 )
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents import llm,stt,tts,inference
+from livekit.agents import AgentStateChangedEvent, MetricsCollectedEvent,metrics
+import time
 
 logger = logging.getLogger("agent")
 
@@ -36,7 +39,7 @@ class Assistant(Agent):
             #     llm=openai.realtime.RealtimeModel(voice="marin")
             instructions=textwrap.dedent(
                 """\
-                You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
+                You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools. Introduce yourself as Tiffany.
 
                 # Output rules
 
@@ -109,22 +112,77 @@ async def my_agent(ctx: JobContext):
 
     # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
+
+
+         # LLM with fallback: OpenAI primary, Gemini backup
+        llm=llm.FallbackAdapter(
+            [
+                inference.LLM(model="openai/gpt-4.1-mini"),
+                inference.LLM(model="google/gemini-2.5-flash"),
+            ]
+        ),
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        stt=stt.FallbackAdapter(
+            [
+                inference.STT(model="deepgram/nova-3", language="multi"),
+                inference.STT(model="assemblyai/universal-streaming"),
+            ]
+        ),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=inference.TTS(
-            model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+         tts=tts.FallbackAdapter(
+            [
+                inference.TTS.from_model_string("cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+                inference.TTS.from_model_string("inworld/inworld-tts-1"),
+            ]
         ),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
+        
         vad=ctx.proc.userdata["vad"],
         # allow the LLM to generate a response while waiting for the end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
+
+    # Aggregate data across all conversation turns
+    usage_collector = metrics.UsageCollector()
+
+    # Track End of Utterance timing (when turn detector decides user finished speaking)
+    last_eou_metrics: metrics.EOUMetrics | None = None
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        nonlocal last_eou_metrics
+        # Capture EOU metrics for TTFA calculation
+        if ev.metrics.type == "eou_metrics":
+            last_eou_metrics = ev.metrics
+
+        # Log each metric as it arrives and add to usage collector
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+
+    async def log_usage():
+        # Print per-session summary (tokens, audio duration, costs)
+        summary = usage_collector.get_summary()
+        logger.info("Usage summary: %s", summary)
+
+
+    # Fire log_usage when worker shuts down
+    ctx.add_shutdown_callback(log_usage)
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev: AgentStateChangedEvent):
+        if ev.new_state == "speaking":
+            if last_eou_metrics:
+                # Calculate time since user finished speaking
+                elapsed = time.time() - last_eou_metrics.timestamp
+                logger.info(f"Time to first audio: {elapsed:.3f}s")
+
+    
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
