@@ -540,7 +540,11 @@ async def my_agent(ctx: JobContext):
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: AgentStateChangedEvent):
-    
+        if ev.new_state == "speaking":
+            if last_eou_metrics:
+                # Calculate time since user finished speaking
+                elapsed = time.time() - last_eou_metrics.timestamp
+                logger.info(f"Time to first audio: {elapsed:.3f}s")
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
