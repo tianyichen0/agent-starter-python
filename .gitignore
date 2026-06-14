@@ -31,3 +31,5 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+credentials.json
+token.json

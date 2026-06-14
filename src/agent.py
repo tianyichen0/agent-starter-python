@@ -243,6 +243,95 @@ class Assistant(Agent):
         except Exception as e:
             return f"Failed to send email: {e}"
 
+    @function_tool()
+    async def add_calendar_reminder(
+            context: RunContext,
+            title: str,
+            start_time: str,
+            duration_minutes: int = 30,
+            description: str = "",
+            timezone: str = "America/New_York",
+    ) -> str:
+        """Add a reminder/event to the user's Google Calendar.
+
+        Args:
+            title: The title of the reminder/event.
+            start_time: The start date and time in ISO 8601 format, e.g. "2026-06-15T14:00:00".
+            duration_minutes: How long the event lasts, in minutes. Defaults to 30.
+            description: Optional additional details about the reminder.
+            timezone: IANA timezone name, e.g. "America/New_York". Defaults to "America/New_York".
+        """
+        try:
+            service = _get_calendar_service()
+
+            start_dt = datetime.datetime.fromisoformat(start_time)
+            end_dt = start_dt + datetime.timedelta(minutes=duration_minutes)
+
+            event = {
+                "summary": title,
+                "description": description,
+                "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone},
+                "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone},
+                "reminders": {
+                    "useDefault": False,
+                    "overrides": [{"method": "popup", "minutes": 10}],
+                },
+            }
+
+            created_event = service.events().insert(calendarId="primary", body=event).execute()
+            return f"Reminder '{title}' added for {start_dt.strftime('%Y-%m-%d %H:%M')}. Link: {created_event.get('htmlLink')}"
+        except Exception as e:
+            return f"Failed to add reminder: {e}"
+
+    @function_tool()
+    async def list_calendar_reminders(
+            context: RunContext,
+            max_results: int = 10,
+            time_min: str = "",
+    ) -> str:
+        """List upcoming reminders/events from the user's Google Calendar.
+
+        Args:
+            max_results: Maximum number of events to return. Defaults to 10.
+            time_min: Optional ISO 8601 datetime to start searching from (e.g. "2026-06-15T00:00:00"). Defaults to now.
+        """
+        try:
+            service = _get_calendar_service()
+
+            if time_min:
+                start_dt = datetime.datetime.fromisoformat(time_min)
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                start_dt = datetime.datetime.now(datetime.timezone.utc)
+
+            time_min_str = start_dt.isoformat()
+
+            events_result = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min_str,
+                    maxResults=max_results,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            events = events_result.get("items", [])
+
+            if not events:
+                return "No upcoming reminders found."
+
+            lines = []
+            for event in events:
+                start = event["start"].get("dateTime", event["start"].get("date"))
+                lines.append(f"- {event.get('summary', '(no title)')} at {start}")
+
+            return "Upcoming reminders:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Failed to fetch reminders: {e}"
+
 
     @function_tool()
     async def lookup_weather(
@@ -300,7 +389,6 @@ class Assistant(Agent):
     async def record_email(self, context: RunContext, email: str) -> None:
         """Record the user's email address"""
         self.complete(EmailResult(email_address=email))
-
 
 
     @function_tool()
