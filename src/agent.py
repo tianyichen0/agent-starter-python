@@ -4,6 +4,7 @@ import httpx
 import smtplib
 import os
 import datetime
+import time
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -330,6 +331,80 @@ class Assistant(Agent):
         except Exception as e:
             return f"Failed to fetch reminders: {e}"
 
+    @function_tool()
+    async def delete_calendar_event(
+            event_id: str = None,
+            title: str = None,
+            start_time: str = None,
+            calendar_id: str = "primary",
+    ) -> str:
+        """
+        Delete an event/reminder from the user's Google Calendar.
+
+        Args:
+            event_id: The exact event ID to delete (preferred if known).
+            title: Title of the event to search for and delete, if event_id is not known.
+            start_time: ISO 8601 datetime to narrow the search when deleting by title
+                         (helps disambiguate events with the same name).
+            calendar_id: Which calendar to delete from. Defaults to "primary".
+
+        Returns:
+            Confirmation message, or an error/disambiguation message.
+        """
+        try:
+            service = get_calendar_service()
+
+            # Direct deletion if event_id is provided
+            if event_id:
+                service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+                return f"Event {event_id} deleted."
+
+            if not title:
+                return "Either event_id or title must be provided to delete an event."
+
+            # Search for matching events by title
+            time_min = None
+            if start_time:
+                start_dt = datetime.fromisoformat(start_time)
+                time_min = (start_dt - timedelta(days=1)).isoformat()
+            else:
+                time_min = datetime.utcnow().isoformat() + "Z"
+
+            events_result = (
+                service.events()
+                .list(
+                    calendarId=calendar_id,
+                    q=title,
+                    timeMin=time_min,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=10,
+                )
+                .execute()
+            )
+
+            events = events_result.get("items", [])
+
+            if not events:
+                return f"No events found matching '{title}'."
+
+            if len(events) > 1:
+                matches = "\n".join(
+                    f"- {e.get('summary')} at {e['start'].get('dateTime', e['start'].get('date'))} (id: {e['id']})"
+                    for e in events
+                )
+                return (
+                    f"Multiple events match '{title}'. Please specify which to delete:\n{matches}"
+                )
+
+            # Exactly one match
+            event = events[0]
+            service.events().delete(calendarId=calendar_id, eventId=event["id"]).execute()
+            return f"Event '{event.get('summary')}' deleted."
+
+        except Exception as e:
+            return f"Failed to delete event: {str(e)}"
+
 
     @function_tool()
     async def lookup_weather(
@@ -483,9 +558,9 @@ async def my_agent(ctx: JobContext):
         # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=stt.FallbackAdapter(
             [
-                inference.STT(model="assemblyai/universal-streaming"),
-                inference.STT(model="deepgram/nova-3", language="multi"),
-
+                inference.STT.from_model_string("assemblyai/universal-streaming:en"),
+                inference.STT.from_model_string("deepgram/nova-3"),
+                inference.STT.from_model_string("xai/stt-1"),
             ]
         ),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
