@@ -41,9 +41,7 @@ from livekit.agents import (
     Agent
 )
 
-
-
-SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_PATH = os.environ.get("GOOGLE_TOKEN_PATH", "token.json")
 
 def _get_calendar_service():
