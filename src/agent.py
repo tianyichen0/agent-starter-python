@@ -39,11 +39,12 @@ from livekit.agents import (
     RunContext,
     ToolError,
     AgentTask,
-    Agent
+    Agent,
 )
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_PATH = os.environ.get("GOOGLE_TOKEN_PATH", "token.json")
+
 
 def _get_calendar_service():
     creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -53,28 +54,96 @@ def _get_calendar_service():
             f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
+
 logger = logging.getLogger(__name__)
 
 load_dotenv(".env.local")
 
+
+# ---------------------------------------------------------------------------
+# AgentTask subclasses — tasks that need self.complete()
+# ---------------------------------------------------------------------------
+
+class CollectConsent(AgentTask[bool]):
+    def __init__(self, chat_ctx=None):
+        super().__init__(
+            instructions="""
+            Introduce yourself and ask if the user wants the session to be recorded.
+            """,
+            chat_ctx=chat_ctx,
+        )
+
+    async def on_enter(self) -> None:
+        await self.session.generate_reply(
+            instructions="""
+            Briefly introduce yourself, then ask for permission to record
+            the call for quality assurance and training purposes.
+            Make it clear that they can decline.
+            """
+        )
+
+    @function_tool()
+    async def consent_given(self) -> None:
+        """Use this when the user gives consent to record."""
+        self.complete(True)
+
+    @function_tool()
+    async def consent_denied(self) -> None:
+        """Use this when the user denies consent to record."""
+        self.complete(False)
+
+
+@dataclass
+class EmailResult:
+    email_address: str
+
+
+@dataclass
+class AddressResult:
+    address: str
+
+
+class CollectEmail(AgentTask[EmailResult]):
+    """Sub-task that collects the user's email address."""
+
+    def __init__(self, chat_ctx=None):
+        super().__init__(
+            instructions="Ask the user for their email address.",
+            chat_ctx=chat_ctx,
+        )
+
+    @function_tool()
+    async def record_email(self, context: RunContext, email: str) -> None:
+        """Record the user's email address."""
+        self.complete(EmailResult(email_address=email))
+
+
+class CollectAddress(AgentTask[AddressResult]):
+    """Sub-task that collects the user's shipping address."""
+
+    def __init__(self, chat_ctx=None):
+        super().__init__(
+            instructions="Ask the user for their shipping address.",
+            chat_ctx=chat_ctx,
+        )
+
+    @function_tool()
+    async def record_address(self, context: RunContext, address: str) -> None:
+        """Record the user's shipping address."""
+        self.complete(AddressResult(address=address))
+
+
+# ---------------------------------------------------------------------------
+# Main Assistant agent
+# ---------------------------------------------------------------------------
+
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-            # See all available models at https://docs.livekit.io/agents/models/llm/
-            #llm=inference.LLM(model="openai/gpt-5.2-chat-latest"),
-            # To use a realtime model instead of a voice pipeline, replace the LLM
-            # with a RealtimeModel and remove the STT/TTS from the AgentSession
-            # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/)
-            # 1. Install livekit-agents[openai]
-            # 2. Set OPENAI_API_KEY in .env.local
-            # 3. Add `from livekit.plugins import openai` to the top of this file
-            # 4. Replace the llm argument with:
-            #     llm=openai.realtime.RealtimeModel(voice="marin")
             instructions=textwrap.dedent(
                 """\
-                You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools. Introduce yourself as Tiffany if the user dosen't know your name.
-                
+                You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools. Introduce yourself as Tiffany if the user doesn't know your name.
+
                 # Output rules
 
                 You are interacting with the user via voice, and must apply the following rules to ensure your output sounds natural in a text-to-speech system:
@@ -108,112 +177,17 @@ class Assistant(Agent):
             ),
         )
 
-    # async def on_enter(self) -> None:
-    #     consent = await CollectConsent(chat_ctx=self.chat_ctx)
-    #
-    #     if consent:
-    #         await self.session.generate_reply(
-    #             instructions="Thank them and offer your assistance."
-    #         )
-    #     else:
-    #         await self.session.generate_reply(
-    #             instructions="Let them know you understand and will proceed without recording."
-    #         )
-
-    # # To add tools, use the @function_tool decorator.
-    # @function_tool()
-    # async def lookup_weather(
-    #         self,
-    #         context: RunContext,  # Gives access to the session, speech handle, and user data
-    #         location: str,  # Type hints help the LLM understand what arguments to pass
-    # ) -> dict:
-    #     """Look up current weather for a location.
-    #
-    #     Args:
-    #         location: City name or location to get weather for.
-    #     """
-    #     # The docstring above becomes the tool description the LLM sees
-    #     # when deciding which tool to call
-    #
-    #     async with httpx.AsyncClient(timeout=10.0) as client:
-    #         # First, geocode the location to get coordinates
-    #
-    #         try:
-    #             geo_response = await client.get(
-    #                 "https://geocoding-api.open-meteo.com/v1/search",
-    #                 params={"name": location, "count": 1}
-    #             )
-    #
-    #             geo_data = geo_response.json()
-    #             #print(geo_data)
-    #
-    #             if not geo_data.get("results"):
-    #                 raise ToolError(f"Could not find location: {location}")
-    #
-    #             lat = geo_data["results"][0]["latitude"]
-    #             lon = geo_data["results"][0]["longitude"]
-    #             #print(lat)
-    #             #print(lon)
-    #             place_name = geo_data["results"][0]["name"]
-    #             #print (place_name)
-    #
-    #             # Get current weather for those coordinates
-    #             weather_response = await client.get(
-    #                 "https://api.open-meteo.com/v1/forecast",
-    #                 params={
-    #                     "latitude": lat,
-    #                     "longitude": lon,
-    #                     "current": "temperature_2m,weather_code",
-    #                     "temperature_unit": "fahrenheit"
-    #                 }
-    #             )
-    #             weather = weather_response.json()
-    #             print(weather)
-    #         except httpx.TimeoutException as e:
-    #             raise ToolError(f"Weather service timed out, please try again: {e}")
-    #
-    #         except httpx.HTTPError as e:
-    #             raise ToolError(f"Weather service error: {e}")
-    #
-    #         WEATHER_CODES = {
-    #             0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-    #             45: "Fog", 48: "Depositing rime fog",
-    #             51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
-    #             61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
-    #             71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
-    #             80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
-    #             95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
-    #         }
-    #
-    #         geo_response.raise_for_status()
-    #         weather_response.raise_for_status()
-    #
-    #         if "current" not in weather:
-    #             raise ToolError(f"Weather data unavailable for {place_name}")
-    #
-    #         return {
-    #             "location": place_name,
-    #             "temperature_f": weather["current"]["temperature_2m"],
-    #             "conditions": WEATHER_CODES.get(weather["current"]["weather_code"], "Unknown"),
-    #         }
-
-
-    @function_tool()
-    async def consent_given(self) -> None:
-        """Use this when the user gives consent to record."""
-        self.complete(True)
-
-    @function_tool()
-    async def consent_denied(self) -> None:
-        """Use this when the user denies consent to record."""
-        self.complete(False)
+    # -----------------------------------------------------------------------
+    # Email tool
+    # -----------------------------------------------------------------------
 
     @function_tool()
     async def send_email(
-            context: RunContext,
-            to_email: str,
-            subject: str,
-            body: str,
+        self,
+        context: RunContext,
+        to_email: str,
+        subject: str,
+        body: str,
     ) -> str:
         """Send an email to a recipient.
 
@@ -242,14 +216,19 @@ class Assistant(Agent):
         except Exception as e:
             return f"Failed to send email: {e}"
 
+    # -----------------------------------------------------------------------
+    # Calendar tools
+    # -----------------------------------------------------------------------
+
     @function_tool()
     async def add_calendar_reminder(
-            context: RunContext,
-            title: str,
-            start_time: str,
-            duration_minutes: int = 30,
-            description: str = "",
-            timezone: str = "America/New_York",
+        self,
+        context: RunContext,
+        title: str,
+        start_time: str,
+        duration_minutes: int = 30,
+        description: str = "",
+        timezone: str = "America/New_York",
     ) -> str:
         """Add a reminder/event to the user's Google Calendar.
 
@@ -277,22 +256,28 @@ class Assistant(Agent):
                 },
             }
 
-            created_event = service.events().insert(calendarId="primary", body=event).execute()
-            return f"Reminder '{title}' added for {start_dt.strftime('%Y-%m-%d %H:%M')}. Link: {created_event.get('htmlLink')}"
+            created_event = (
+                service.events().insert(calendarId="primary", body=event).execute()
+            )
+            return (
+                f"Reminder '{title}' added for "
+                f"{start_dt.strftime('%Y-%m-%d %H:%M')}."
+            )
         except Exception as e:
             return f"Failed to add reminder: {e}"
 
     @function_tool()
     async def list_calendar_reminders(
-            context: RunContext,
-            max_results: int = 10,
-            time_min: str = "",
+        self,
+        context: RunContext,
+        max_results: int = 10,
+        time_min: str = "",
     ) -> str:
         """List upcoming reminders/events from the user's Google Calendar.
 
         Args:
             max_results: Maximum number of events to return. Defaults to 10.
-            time_min: Optional ISO 8601 datetime to start searching from (e.g. "2026-06-15T00:00:00"). Defaults to now.
+            time_min: Optional ISO 8601 datetime to start searching from, e.g. "2026-06-15T00:00:00". Defaults to now.
         """
         try:
             service = _get_calendar_service()
@@ -333,42 +318,128 @@ class Assistant(Agent):
 
     @function_tool()
     async def delete_calendar_event(
-            event_id: str = None,
-            title: str = None,
-            start_time: str = None,
-            calendar_id: str = "primary",
+        self,
+        context: RunContext,
+        title: str = None,
+        event_id: str = None,
+        start_time: str = None,
+        calendar_id: str = "primary",
     ) -> str:
-        """
-        Delete an event/reminder from the user's Google Calendar.
+        """Delete an event/reminder from the user's Google Calendar.
 
         Args:
+            title: Title of the event to search for and delete.
             event_id: The exact event ID to delete (preferred if known).
-            title: Title of the event to search for and delete, if event_id is not known.
-            start_time: ISO 8601 datetime to narrow the search when deleting by title
-                         (helps disambiguate events with the same name).
-            calendar_id: Which calendar to delete from. Defaults to "primary".
-
-        Returns:
-            Confirmation message, or an error/disambiguation message.
+            start_time: ISO 8601 datetime to narrow the search when deleting by title.
+            calendar_id: Which calendar to delete from. Defaults to primary.
         """
         try:
-            service = get_calendar_service()
+            service = _get_calendar_service()
 
             # Direct deletion if event_id is provided
             if event_id:
-                service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
-                return f"Event {event_id} deleted."
+                service.events().delete(
+                    calendarId=calendar_id, eventId=event_id
+                ).execute()
+                return "Event deleted successfully."
 
             if not title:
-                return "Either event_id or title must be provided to delete an event."
+                return "Please provide either an event ID or a title to delete an event."
 
-            # Search for matching events by title
-            time_min = None
+            # Build a timezone-aware timeMin — always include UTC offset
             if start_time:
-                start_dt = datetime.fromisoformat(start_time)
-                time_min = (start_dt - timedelta(days=1)).isoformat()
+                start_dt = datetime.datetime.fromisoformat(start_time)
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=datetime.timezone.utc)
+                # Search from 1 day before to catch events that have already started
+                search_from = start_dt - datetime.timedelta(days=1)
             else:
-                time_min = datetime.utcnow().isoformat() + "Z"
+                # Search from 7 days ago so recently-started events are included
+                search_from = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    - datetime.timedelta(days=7)
+                )
+
+            time_min = search_from.isoformat()
+
+            events_result = (
+                service.events()
+                .list(
+                    calendarId=calendar_id,
+                    q=title,
+                    timeMin=time_min,
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=20,
+                )
+                .execute()
+            )
+
+            events = events_result.get("items", [])
+
+            # Filter to events whose title closely matches what the user said
+            title_lower = title.lower()
+            matched = [
+                e for e in events
+                if title_lower in e.get("summary", "").lower()
+            ]
+
+            # Fall back to all search results if the filter removes everything
+            if not matched:
+                matched = events
+
+            if not matched:
+                return f"No events found matching '{title}'."
+
+            if len(matched) > 1:
+                matches = ", ".join(
+                    f"{e.get('summary')} on "
+                    f"{e['start'].get('dateTime', e['start'].get('date'))}"
+                    for e in matched
+                )
+                return (
+                    f"I found multiple events that match: {matches}. "
+                    f"Can you tell me which date or time you mean?"
+                )
+
+            # Exactly one match — delete it
+            event = matched[0]
+            service.events().delete(
+                calendarId=calendar_id, eventId=event["id"]
+            ).execute()
+            return f"Done, '{event.get('summary')}' has been deleted."
+
+        except Exception as e:
+            return f"Failed to delete event: {str(e)}"
+
+    @function_tool()
+    async def update_calendar_event(
+        self,
+        context: RunContext,
+        title: str,
+        new_title: str = None,
+        new_start_time: str = None,
+        new_duration_minutes: int = None,
+        new_description: str = None,
+        timezone: str = "America/New_York",
+        calendar_id: str = "primary",
+    ) -> str:
+        """Update or reschedule an existing event on the user's Google Calendar.
+
+        Args:
+            title: The current title of the event to find and update.
+            new_title: Optional new title to rename the event to.
+            new_start_time: Optional new start time in ISO 8601 format, e.g. "2026-06-20T14:00:00".
+            new_duration_minutes: Optional new duration in minutes.
+            new_description: Optional new description or notes for the event.
+            timezone: IANA timezone name. Defaults to "America/New_York".
+            calendar_id: Which calendar to update. Defaults to primary.
+        """
+        try:
+            service = _get_calendar_service()
+
+            # Search for the event by title
+            time_min = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
             events_result = (
                 service.events()
@@ -386,45 +457,90 @@ class Assistant(Agent):
             events = events_result.get("items", [])
 
             if not events:
-                return f"No events found matching '{title}'."
+                return f"No upcoming events found matching '{title}'."
 
             if len(events) > 1:
-                matches = "\n".join(
-                    f"- {e.get('summary')} at {e['start'].get('dateTime', e['start'].get('date'))} (id: {e['id']})"
+                matches = ", ".join(
+                    f"{e.get('summary')} on "
+                    f"{e['start'].get('dateTime', e['start'].get('date'))}"
                     for e in events
                 )
                 return (
-                    f"Multiple events match '{title}'. Please specify which to delete:\n{matches}"
+                    f"Multiple events match that title: {matches}. "
+                    f"Can you be more specific about which one to update?"
                 )
 
-            # Exactly one match
             event = events[0]
-            service.events().delete(calendarId=calendar_id, eventId=event["id"]).execute()
-            return f"Event '{event.get('summary')}' deleted."
+
+            # Apply updates — only change fields the user specified
+            if new_title:
+                event["summary"] = new_title
+
+            if new_description is not None:
+                event["description"] = new_description
+
+            if new_start_time:
+                new_start_dt = datetime.datetime.fromisoformat(new_start_time)
+
+                # Preserve original duration unless a new one is given
+                if new_duration_minutes:
+                    duration = datetime.timedelta(minutes=new_duration_minutes)
+                else:
+                    old_start = datetime.datetime.fromisoformat(
+                        event["start"]["dateTime"].replace("Z", "+00:00")
+                    )
+                    old_end = datetime.datetime.fromisoformat(
+                        event["end"]["dateTime"].replace("Z", "+00:00")
+                    )
+                    duration = old_end - old_start
+
+                new_end_dt = new_start_dt + duration
+                event["start"] = {"dateTime": new_start_dt.isoformat(), "timeZone": timezone}
+                event["end"] = {"dateTime": new_end_dt.isoformat(), "timeZone": timezone}
+
+            elif new_duration_minutes:
+                # Duration changed but start time stays the same
+                old_start = datetime.datetime.fromisoformat(
+                    event["start"]["dateTime"].replace("Z", "+00:00")
+                )
+                new_end_dt = old_start + datetime.timedelta(minutes=new_duration_minutes)
+                event["end"] = {"dateTime": new_end_dt.isoformat(), "timeZone": timezone}
+
+            updated_event = (
+                service.events()
+                .update(calendarId=calendar_id, eventId=event["id"], body=event)
+                .execute()
+            )
+
+            updated_start = updated_event["start"].get(
+                "dateTime", updated_event["start"].get("date")
+            )
+            updated_title = updated_event.get("summary", title)
+            return f"Event '{updated_title}' has been updated for {updated_start}."
 
         except Exception as e:
-            return f"Failed to delete event: {str(e)}"
+            return f"Failed to update event: {str(e)}"
 
+    # -----------------------------------------------------------------------
+    # Weather tool
+    # -----------------------------------------------------------------------
 
     @function_tool()
     async def lookup_weather(
-            self,
-            context: RunContext,  # Gives access to the session, speech handle, and user data
-            location: str,  # Type hints help the LLM understand what arguments to pass
+        self,
+        context: RunContext,
+        location: str,
     ) -> dict:
         """Look up current weather for a location.
 
         Args:
             location: City name or location to get weather for.
         """
-        # The docstring above becomes the tool description the LLM sees
-        # when deciding which tool to call
-
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 weather_response = await client.get(
                     f"https://wttr.in/{location}",
-                    params={"format": "j1"}
+                    params={"format": "j1"},
                 )
                 weather_response.raise_for_status()
                 weather = weather_response.json()
@@ -448,47 +564,28 @@ class Assistant(Agent):
                 "conditions": current["weatherDesc"][0]["value"],
             }
 
-    # Define result types for each task
-    @dataclass
-    class EmailResult:
-        email_address: str
-
-    @dataclass
-    class AddressResult:
-        address: str
-
-
-    @function_tool()
-    async def record_email(self, context: RunContext, email: str) -> None:
-        """Record the user's email address"""
-        self.complete(EmailResult(email_address=email))
-
-
-    @function_tool()
-    async def record_address(self, context: RunContext, address: str) -> None:
-        """Record the user's shipping address"""
-        self.complete(AddressResult(address=address))
+    # -----------------------------------------------------------------------
+    # Stock price tool
+    # -----------------------------------------------------------------------
 
     @function_tool()
     async def lookup_stock_price(
-            self,
-            context: RunContext,
-            company: str,
+        self,
+        context: RunContext,
+        company: str,
     ) -> dict:
         """Look up the current stock price for a company.
 
         Args:
             company: Company name or ticker symbol, e.g. "Apple", "AAPL", "Tesla".
         """
-
-        FINNHUB_API_KEY=os.getenv("FINNHUB_API_KEY")
+        FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
-                # Resolve company name to ticker symbol
                 search_response = await client.get(
                     "https://finnhub.io/api/v1/search",
-                    params={"q": company, "token": FINNHUB_API_KEY}
+                    params={"q": company, "token": FINNHUB_API_KEY},
                 )
                 search_response.raise_for_status()
                 search_data = search_response.json()
@@ -500,10 +597,9 @@ class Assistant(Agent):
                 ticker = results[0]["symbol"]
                 name = results[0].get("description", ticker)
 
-                # Get current quote for resolved ticker
                 quote_response = await client.get(
                     "https://finnhub.io/api/v1/quote",
-                    params={"symbol": ticker, "token": FINNHUB_API_KEY}
+                    params={"symbol": ticker, "token": FINNHUB_API_KEY},
                 )
                 quote_response.raise_for_status()
                 quote = quote_response.json()
@@ -526,6 +622,10 @@ class Assistant(Agent):
         }
 
 
+# ---------------------------------------------------------------------------
+# Server setup
+# ---------------------------------------------------------------------------
+
 server = AgentServer()
 
 
@@ -538,24 +638,17 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
     session = AgentSession(
         llm=llm.FallbackAdapter(
             [
-                #200ms
                 inference.LLM(model="openai/gpt-5.3-chat-latest"),
                 inference.LLM(model="google/gemini-2.5-flash"),
-
             ]
         ),
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=stt.FallbackAdapter(
             [
                 inference.STT.from_model_string("assemblyai/universal-streaming:en"),
@@ -563,63 +656,45 @@ async def my_agent(ctx: JobContext):
                 inference.STT.from_model_string("xai/stt-1"),
             ]
         ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=tts.FallbackAdapter(
             [
-                inference.TTS.from_model_string("cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+                inference.TTS.from_model_string(
+                    "cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+                ),
                 inference.TTS.from_model_string("inworld/inworld-tts-1"),
             ]
         ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
-    mcp_servers = [
-        mcp.MCPServerHTTP(url="https://docs.livekit.io/mcp")
-    ]
+    mcp_servers = [mcp.MCPServerHTTP(url="https://docs.livekit.io/mcp")]
 
-    # Aggregate data across all conversation turns
     usage_collector = metrics.UsageCollector()
-
-    # Track End of Utterance timing (when turn detector decides user finished speaking)
     last_eou_metrics: metrics.EOUMetrics | None = None
 
     @session.on("metrics_collected")
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         nonlocal last_eou_metrics
-        # Capture EOU metrics for TTFA calculation
         if ev.metrics.type == "eou_metrics":
             last_eou_metrics = ev.metrics
-
-        # Log each metric as it arrives and add to usage collector
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
-
     async def log_usage():
-        # Print per-session summary (tokens, audio duration, costs)
         summary = usage_collector.get_summary()
         logger.info("Usage summary: %s", summary)
 
-
-    # Fire log_usage when worker shuts down
     ctx.add_shutdown_callback(log_usage)
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: AgentStateChangedEvent):
         if ev.new_state == "speaking":
             if last_eou_metrics:
-                # Calculate time since user finished speaking
                 elapsed = time.time() - last_eou_metrics.timestamp
                 logger.info(f"Time to first audio: {elapsed:.3f}s")
 
-    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=Assistant(),
         room=ctx.room,
@@ -632,48 +707,7 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = anam.AvatarSession(
-    #     persona_config=anam.PersonaConfig(
-    #         name="...",
-    #         avatarId="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/anam
-    #     ),
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Join the room and connect to the user
     await ctx.connect()
-
-class CollectConsent(AgentTask[bool]):
-    def __init__(self, chat_ctx=None):
-        super().__init__(
-            instructions="""
-            Introduce yourself and ask if the user wants the session to be recorded.
-            """,
-            chat_ctx=chat_ctx,
-        )
-
-    async def on_enter(self) -> None:
-        await self.session.generate_reply(
-            instructions="""
-            Briefly introduce yourself, then ask for permission to record 
-            the call for quality assurance and training purposes.
-            Make it clear that they can decline.
-            """
-        )
-
-    @function_tool()
-    async def consent_given(self) -> None:
-        """Use this when the user gives consent to record."""
-        self.complete(True)
-
-    @function_tool()
-    async def consent_denied(self) -> None:
-        """Use this when the user denies consent to record."""
-        self.complete(False)
-
 
 
 if __name__ == "__main__":
